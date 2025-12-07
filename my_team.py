@@ -132,16 +132,14 @@ def choose_best_offset(game_state, entry_points, is_red):
 
 def get_split_defensive_checkpoints(game_state, index):
     """
-    Returns FOUR defensive checkpoints:
+    Returns FOUR defensive checkpoints using connectivity-based clustering:
         - upper_defender:   (upper_cp, mid_upper_cp)
         - lower_defender:   (mid_lower_cp, lower_cp)
 
-    Automatically:
-      - finds entry tunnels
-      - detects inward choke depth
-      - divides region evenly
-      - relocates checkpoints if walls exist
+    This avoids dead-end trapping by grouping inward points by reachable regions.
     """
+
+    from collections import deque
 
     walls = game_state.get_walls()
     w, h = walls.width, walls.height
@@ -149,40 +147,60 @@ def get_split_defensive_checkpoints(game_state, index):
 
     # ---------- 1. Find crossing entry tiles ----------
     mid_x = w//2 - 1 if is_red else w//2
-    entry_points = [(mid_x, y) for y in range(h)
-                    if not game_state.has_wall(mid_x, y)]
+    entry_points = [(mid_x, y) for y in range(h) if not game_state.has_wall(mid_x, y)]
 
     if not entry_points:
-        # fallback (almost never happens)
-        return (None, None, None, None)
+        return [None, None, None, None]
 
     # ---------- 2. Choose inward choke depth ----------
     offset = choose_best_offset(game_state, entry_points, is_red)
     dx = -offset if is_red else offset
-    inward_points = [(x+dx, y) for x, y in entry_points]
+    inward_points = [(x+dx, y) for x, y in entry_points if 0 <= x+dx < w]
 
-    # ---------- 3. Split into quarters ----------
-    inward_points.sort(key=lambda p: p[1])
+    # ---------- 3. BFS-based connectivity clustering ----------
+    visited = set()
+    clusters = []
 
-    n = len(inward_points)
-    q1 = inward_points[: n//4] or [inward_points[0]]
-    q2 = inward_points[n//4 : n//2] or [inward_points[n//4]]
-    q3 = inward_points[n//2 : 3*n//4] or [inward_points[n//2]]
-    q4 = inward_points[3*n//4 :] or [inward_points[-1]]
+    def neighbors(pos):
+        x, y = pos
+        for nx, ny in [(x+1,y),(x-1,y),(x,y+1),(x,y-1)]:
+            if 0 <= nx < w and 0 <= ny < h and not game_state.has_wall(nx, ny):
+                yield (nx, ny)
 
-    # Centroid helper
+    for pt in inward_points:
+        if pt in visited:
+            continue
+        cluster = []
+        q = deque([pt])
+        visited.add(pt)
+        while q:
+            p = q.popleft()
+            cluster.append(p)
+            for n in neighbors(p):
+                if n in inward_points and n not in visited:
+                    visited.add(n)
+                    q.append(n)
+        clusters.append(cluster)
+
+    # Sort clusters top to bottom
+    clusters.sort(key=lambda c: min(p[1] for p in c))
+
+    # ---------- 4. Compute centroids ----------
     def centroid(points):
         xs = [p[0] for p in points]
         ys = [p[1] for p in points]
         return (sum(xs)//len(xs), sum(ys)//len(ys))
 
-    # ---------- 4. Compute 4 anchors ----------
-    upper_cp      = centroid(q1)
-    mid_upper_cp  = centroid(q2)
-    mid_lower_cp  = centroid(q3)
-    lower_cp      = centroid(q4)
+    # If fewer than 4 clusters, replicate centroids as needed
+    while len(clusters) < 4:
+        clusters.append(clusters[-1])
 
-    # ---------- 5. BFS shift away from walls ----------
+    upper_cp      = centroid(clusters[0])
+    mid_upper_cp  = centroid(clusters[1])
+    mid_lower_cp  = centroid(clusters[2])
+    lower_cp      = centroid(clusters[3])
+
+    # ---------- 5. Shift away from walls ----------
     upper_cp      = nearest_free(game_state, upper_cp)
     mid_upper_cp  = nearest_free(game_state, mid_upper_cp)
     mid_lower_cp  = nearest_free(game_state, mid_lower_cp)
