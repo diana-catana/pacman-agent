@@ -139,7 +139,7 @@ class ComplexStateAgent(CaptureAgent):
             if self.current_state != "HOME":
                 print(self.index, self.current_state,"HOME")
             self.current_state = "HOME"
-        elif num_carring > 0 and dist_home + 1 >= game_state.data.timeleft / 4.:
+        elif num_carring > 0 and dist_home + 3 >= game_state.data.timeleft / 4.:
             if self.current_state != "HOME":
                 print(self.index, self.current_state,"HOME TIMEOUT")
             self.current_state = "HOME"
