@@ -1,713 +1,384 @@
-
 from contest.capture_agents import CaptureAgent
-import contest.util as util
-import random, time
-from contest.util import nearest_point
-
 from contest.game import Directions, Actions
-import contest.game
-import json
-
-from collections import deque
-
-def nearest_free(game_state, start):
-    """Return nearest non-wall tile using BFS."""
-    w = game_state.get_walls().width
-    h = game_state.get_walls().height
-    q = deque([start])
-    visited = {start}
-    while q:
-        x, y = q.popleft()
-        if 0 <= x < w and 0 <= y < h and not game_state.has_wall(x, y):
-            return (x, y)
-        for dx, dy in [(1,0),(-1,0),(0,1),(0,-1)]:
-            nx, ny = x+dx, y+dy
-            if (nx, ny) not in visited:
-                visited.add((nx, ny))
-                q.append((nx, ny))
-    return start
-
-def choose_best_offset(game_state, entry_points, is_red):
-    """Automatically choose inward distance (1,2,3) depending on choke depth."""
-    best_offset = 1
-    best_valid = -1
-    
-    for offset in [1, 2, 3]:
-        dx = -offset if is_red else offset
-        inward = [(x+dx, y) for x, y in entry_points]
-        valid = sum(1 for (x,y) in inward if not game_state.has_wall(x,y))
-        if valid > best_valid:
-            best_valid = valid
-            best_offset = offset
-
-    return best_offset
-
-def get_defensive_checkpoints(game_state, index):
-    """
-    Returns (lower_checkpoint, upper_checkpoint) for ANY layout.
-    Automatically:
-      - finds entry tunnels
-      - detects inward choke depth
-      - places checkpoints correctly
-      - avoids walls
-    """
-
-    walls = game_state.get_walls()
-    w, h = walls.width, walls.height
-    is_red = game_state.is_on_red_team(index)
-
-    # ----- 1. find midline entry points -----
-    mid_x = w//2 - 1 if is_red else w//2
-    entry_points = [(mid_x, y) for y in range(h)
-                    if not game_state.has_wall(mid_x, y)]
-
-    if not entry_points:
-        # fallback: shouldn't happen on legal layouts
-        mid_y = h//2
-        return ( (mid_x, mid_y-1), (mid_x, mid_y+1) )
-
-    # ----- 2. dynamically choose best inward offset -----
-    offset = choose_best_offset(game_state, entry_points, is_red)
-    dx = -offset if is_red else offset
-
-    inward_points = [(x+dx, y) for x, y in entry_points]
-
-    # ----- 3. split into upper / lower groups -----
-    inward_points.sort(key=lambda p: p[1])
-    mid = len(inward_points)//2
-
-    lower_group = inward_points[:mid]
-    upper_group = inward_points[mid:]
-
-    # Safety fallback if one group ends empty
-    if len(lower_group) == 0: lower_group = upper_group
-    if len(upper_group) == 0: upper_group = lower_group
-
-    # ----- 4. centroid of each group -----
-    def centroid(points):
-        xs = [p[0] for p in points]
-        ys = [p[1] for p in points]
-        return (sum(xs)//len(xs), sum(ys)//len(ys))
-
-    lower_cp = centroid(lower_group)
-    upper_cp = centroid(upper_group)
-
-    # ----- 5. BFS shift off a wall -----
-    lower_cp = nearest_free(game_state, lower_cp)
-    upper_cp = nearest_free(game_state, upper_cp)
-
-    return lower_cp, upper_cp
-
-def nearest_free(game_state, start):
-    """Return nearest non-wall tile using BFS."""
-    w = game_state.get_walls().width
-    h = game_state.get_walls().height
-    q = deque([start])
-    visited = {start}
-    while q:
-        x, y = q.popleft()
-        if 0 <= x < w and 0 <= y < h and not game_state.has_wall(x, y):
-            return (x, y)
-        for dx, dy in [(1,0),(-1,0),(0,1),(0,-1)]:
-            nx, ny = x+dx, y+dy
-            if (nx, ny) not in visited:
-                visited.add((nx, ny))
-                q.append((nx, ny))
-    return start
+from contest.util import nearest_point
+import contest.util as util
+import random
 
 
-def choose_best_offset(game_state, entry_points, is_red):
-    best_offset = 1
-    best_valid = -1
-
-    for offset in [1, 2, 3]:
-        dx = -offset if is_red else offset
-        inward = [(x+dx, y) for x, y in entry_points]
-        valid = sum(1 for (x,y) in inward if not game_state.has_wall(x, y))
-        if valid > best_valid:
-            best_valid = valid
-            best_offset = offset
-
-    return best_offset
-
-def get_split_defensive_checkpoints(game_state, index):
-    """
-    Returns FOUR defensive checkpoints using connectivity-based clustering:
-        - upper_defender:   (upper_cp, mid_upper_cp)
-        - lower_defender:   (mid_lower_cp, lower_cp)
-
-    This avoids dead-end trapping by grouping inward points by reachable regions.
-    """
-
-    from collections import deque
-
-    walls = game_state.get_walls()
-    w, h = walls.width, walls.height
-    is_red = game_state.is_on_red_team(index)
-
-    # ---------- 1. Find crossing entry tiles ----------
-    mid_x = w//2 - 1 if is_red else w//2
-    entry_points = [(mid_x, y) for y in range(h) if not game_state.has_wall(mid_x, y)]
-
-    if not entry_points:
-        return [None, None, None, None]
-
-    # ---------- 2. Choose inward choke depth ----------
-    offset = choose_best_offset(game_state, entry_points, is_red)
-    dx = -offset if is_red else offset
-    inward_points = [(x+dx, y) for x, y in entry_points if 0 <= x+dx < w]
-
-    # ---------- 3. BFS-based connectivity clustering ----------
-    visited = set()
-    clusters = []
-
-    def neighbors(pos):
-        x, y = pos
-        for nx, ny in [(x+1,y),(x-1,y),(x,y+1),(x,y-1)]:
-            if 0 <= nx < w and 0 <= ny < h and not game_state.has_wall(nx, ny):
-                yield (nx, ny)
-
-    for pt in inward_points:
-        if pt in visited:
-            continue
-        cluster = []
-        q = deque([pt])
-        visited.add(pt)
-        while q:
-            p = q.popleft()
-            cluster.append(p)
-            for n in neighbors(p):
-                if n in inward_points and n not in visited:
-                    visited.add(n)
-                    q.append(n)
-        clusters.append(cluster)
-
-    # Sort clusters top to bottom
-    clusters.sort(key=lambda c: min(p[1] for p in c))
-
-    # ---------- 4. Compute centroids ----------
-    def centroid(points):
-        xs = [p[0] for p in points]
-        ys = [p[1] for p in points]
-        return (sum(xs)//len(xs), sum(ys)//len(ys))
-
-    # If fewer than 4 clusters, replicate centroids as needed
-    while len(clusters) < 4:
-        clusters.append(clusters[-1])
-
-    upper_cp      = centroid(clusters[0])
-    mid_upper_cp  = centroid(clusters[1])
-    mid_lower_cp  = centroid(clusters[2])
-    lower_cp      = centroid(clusters[3])
-
-    # ---------- 5. Shift away from walls ----------
-    upper_cp      = nearest_free(game_state, upper_cp)
-    mid_upper_cp  = nearest_free(game_state, mid_upper_cp)
-    mid_lower_cp  = nearest_free(game_state, mid_lower_cp)
-    lower_cp      = nearest_free(game_state, lower_cp)
-
-    return [upper_cp, mid_upper_cp, mid_lower_cp, lower_cp]
+def create_team(first_index, second_index, is_red,
+                first='ComplexStateAgent', second='ComplexStateAgent', num_training=0):
+    return [eval(first)(first_index), eval(second)(second_index)]
 
 
-def create_team(first_index, second_index, is_red,  first = 'Agent2', second = 'Agent1', num_training = 10, **args):
-  return [eval(first)(first_index), eval(second)(second_index)]
-
-
-class DDagent(CaptureAgent):
-
-
-
-  def rec(self,i,j,depth_map,visited,h):
-    sum = 0
-    visited[h-i-1][j] = True
-    direction = [(-1, 0), (1, 0), (0, -1), (0, 1)]
-    for dy,dx in direction:
-      y = i + dy
-      x = j + dx
-      if visited[h-y-1][x] == False and depth_map[h-y-1][x] == 3:
-        self.dead_ends_depth[h-y-1][x] = self.rec(y,x,depth_map,visited,h)
-        sum = self.dead_ends_depth[h-y-1][x]
-    return sum + 1
-
-  def register_initial_state(self, game_state):
-    self.enemy_cost = 1.5
-    self.own_cost = 1.0
-    self.layout_width = game_state.data.layout.width
-
-    w = game_state.data.layout.width
-    h = game_state.data.layout.height
-
-
-    # Initialize state maps
-    self.dead_ends_depth = [[0] * w for _ in range(h)]
-    depth_map = [[0] * w for _ in range(h)]
-    visited = [[False] * w for _ in range(h)]
-    walls = game_state.get_walls()
-    self.walls = walls
-    queue = util.Queue()
-    # Start exploration from each unvisited, non-wall cell
-    for i in range(h):
-        for j in range(w):
-            if not game_state.has_wall(j, i):
-                neighbors = Actions.get_legal_neighbors((j, i), walls)
-                depth_map[h-i-1][j] = len(neighbors)
-                if len(neighbors) == 2:
-                  queue.push((i, j))
-    
-    while not queue.is_empty():
-      i,j = queue.pop()
-      self.dead_ends_depth[h-i-1][j] = self.rec(i,j,depth_map,visited,h)
-
-    self.max_dead_end = max(value for row in self.dead_ends_depth for value in row)
-
-    # self.initial_weight()
-    self.total_food = len(self.get_food(game_state).as_list())
-    width = game_state.data.layout.width
-    height = game_state.data.layout.height
-    self.max_distance = (width**2 + height**2)**0.5
-
-    neighbors = []
-    if game_state.is_on_red_team(self.index):
-      neighbors = [(0, 1), (0, -1), (-1, 1), (-1, 0), (-1,-1) ]
-    else:
-      neighbors = [(0, 1), (0, -1), (1, 1), (1, 0), (1,-1) ]
-
-    self.weights_array = self.get_weights()
-    self.initial_weight()
-
-
-    # LOWER CHECK POINT
-    temp_h = max(1, h - 3)
-    if game_state.is_on_red_team(self.index):
-      self.defence_ancor_point1 = (w // 2 - 2, temp_h)
-    else:
-      self.defence_ancor_point1 = (w // 2 + 1, temp_h)
-
-    if game_state.has_wall(self.defence_ancor_point1[0], self.defence_ancor_point1[1]):
-      dist = 1
-      while game_state.has_wall(self.defence_ancor_point1[0], self.defence_ancor_point1[1]):
-        for dx,dy in neighbors:
-          self.defence_ancor_point1 = (self.defence_ancor_point1[0] + dist*dx, self.defence_ancor_point1[1] + dist * dy)
-          if not game_state.has_wall(self.defence_ancor_point1[0], self.defence_ancor_point1[1]):
-            break
-        dist += 1
-    self.default_defence_ancor_point1 = self.defence_ancor_point1
-
-    # UPPER CHECK POINT
-    temp_h = min(h-2 , 3)
-    if game_state.is_on_red_team(self.index):
-      self.defence_ancor_point2 = (w // 2 - 2, temp_h)
-    else:
-      self.defence_ancor_point2 = (w // 2 + 1, temp_h)
-
-    if game_state.has_wall(self.defence_ancor_point2[0], self.defence_ancor_point2[1]):
-      dist = 1
-      while game_state.has_wall(self.defence_ancor_point2[0], self.defence_ancor_point2[1]):
-        for dx,dy in neighbors:
-          self.defence_ancor_point2 = (self.defence_ancor_point2[0] + dist*dx, self.defence_ancor_point2[1] + dist * dy)
-          if not game_state.has_wall(self.defence_ancor_point2[0], self.defence_ancor_point2[1]):
-            break
-        dist += 1
-    self.default_defence_ancor_point2 = self.defence_ancor_point2
-    
-    self.defence_ancor_point = self.default_defence_ancor_point2
-    
-    # self.default_defence_ancor_point1, self.default_defence_ancor_point2 = get_defensive_checkpoints(game_state, self.index)
-    self.double_anchors = get_split_defensive_checkpoints(game_state, self.index)
-    self.mode = "ATTACK"
-
-
+class ComplexStateAgent(CaptureAgent):
+    def register_initial_state(self, game_state):
+        CaptureAgent.register_initial_state(self, game_state)
+        self.start_pos = game_state.get_agent_position(self.index)
+        self.height = game_state.data.layout.height
+        self.width = game_state.data.layout.width
+        # Identity
+        self.red = game_state.is_on_red_team(self.index)
+        self.teammate_index = (self.index + 2) % 4
         
+        # Map Analysis
+        self.mid_x = game_state.data.layout.width // 2
+        if self.red: self.mid_x -= 1
+        self.boundary_points = self.get_boundary_points(game_state)
+        self.safe_areas = [pos for group in self.boundary_points for pos in group]
+        
+        # State Variables
+        self.current_state = 'ATTACK_FOOD'
+        self.target_position = None
+        
+            # Initialize state maps
+        self.compute_dead_ends(game_state)
+        self.depth_binary_mask = [[1 if self.dead_ends_depth[y][x] > 0 else 0 for x in range(self.width)]for y in range(self.height)]
 
-    self.start = game_state.get_agent_position(self.index)
-    CaptureAgent.register_initial_state(self, game_state)
+    def get_boundary_points(self, game_state):
+        points = []
+        group = []
+        prev_wall = False
+        for y in range(self.height):
+            curr_wall = game_state.has_wall(self.mid_x, y)
+            if not curr_wall:
+                if prev_wall and len(group) > 0:
+                    points.append(group)
+                    group = []
+                group.append((self.mid_x,y))
+            prev_wall = curr_wall
+        if len(group)> 0: points.append(group)
+        return points
 
-  def evaluate(self, game_state, action):
-    features = self.get_features(game_state, action)
-    # print(self.index, action, features)
-    # print()
-    return features * self.weights
+    def compute_dead_ends(self, game_state):
+        walls = game_state.get_walls()
+        W, H = walls.width, walls.height
 
-  def get_successor(self, game_state, action):
-        """
-        Finds the next successor which is a grid position (location tuple).
-        """
-        successor = game_state.generate_successor(self.index, action)
-        pos = successor.get_agent_state(self.index).get_position()
-        if pos != nearest_point(pos):
-            # Only half a grid position was covered
-            return successor.generate_successor(self.index, action)
+        # degree[y][x] = number of free neighbor CELLS (no STOP)
+        degree = [[0 for _ in range(W)] for _ in range(H)]
+        temp = [[0 for _ in range(W)] for _ in range(H)]
+        visited = [[False for _ in range(W)] for _ in range(H)]
+
+        # 1) compute degrees using neighbor cells
+        for x in range(W):
+            for y in range(H):
+                if walls[x][y]:
+                    continue
+                neighbors = Actions.get_legal_neighbors((x, y), walls)  # returns list of (nx, ny)
+                degree[y][x] = len(neighbors) - 1  # 0..4, STOP excluded
+
+        # 2) start BFS from true dead-ends (degree == 1)
+        queue = util.Queue()
+        for y in range(H):
+            for x in range(W):
+                if degree[y][x] == 1:
+                    temp[y][x] = 1      # distance-from-leaf
+                    visited[y][x] = True
+                    queue.push((x, y))
+
+        # 3) BFS outward through corridors (degree == 2)
+        while not queue.is_empty():
+            x, y = queue.pop()
+            for nx, ny in Actions.get_legal_neighbors((x, y), walls):
+                if visited[ny][nx]:
+                    continue
+                # only propagate through corridor cells (degree 2)
+                if degree[ny][nx] == 2:
+                    visited[ny][nx] = True
+                    temp[ny][nx] = temp[y][x] + 1
+                    queue.push((nx, ny))
+
+        # 4) Now temp contains distance-from-closest-leaf (leaf=1, increases towards junction).
+        #    We need to reverse numbering inside each connected component of temp>0
+        final = [[0 for _ in range(W)] for _ in range(H)]
+        comp_visited = [[False for _ in range(W)] for _ in range(H)]
+
+        for y in range(H):
+            for x in range(W):
+                if temp[y][x] > 0 and not comp_visited[y][x]:
+                    # flood-fill this component of temp>0 cells
+                    stack = [(x, y)]
+                    comp_cells = []
+                    comp_max = 0
+                    comp_visited[y][x] = True
+
+                    while stack:
+                        cx, cy = stack.pop()
+                        comp_cells.append((cx, cy))
+                        if temp[cy][cx] > comp_max:
+                            comp_max = temp[cy][cx]
+
+                        for nx, ny in Actions.get_legal_neighbors((cx, cy), walls):
+                            if temp[ny][nx] > 0 and not comp_visited[ny][nx]:
+                                comp_visited[ny][nx] = True
+                                stack.append((nx, ny))
+
+                    # reverse depths inside this component: entrance=1 ... deepest=comp_max
+                    for cx, cy in comp_cells:
+                        final[cy][cx] = comp_max - temp[cy][cx] + 1
+
+        # store into self if you want
+        self.dead_ends_depth = final
+        return final
+
+    def get_non_deadend_actions(self, game_state):
+        actions = game_state.get_legal_actions(self.index)
+        legal_actions = []
+        for action in actions:
+            successor = game_state.generate_successor(self.index, action)
+            nx,ny = successor.get_agent_state(self.index).get_position()
+            nx,ny = int(nx), int(ny)
+            if self.depth_binary_mask[ny][nx] == 0:
+                legal_actions.append(action)
+        return legal_actions
+    
+    def update_state(self, game_state, obs):
+        # If a ghost is within 5 units, switch to CONSCIOUS mode
+        dist_home = min([self.get_maze_distance(obs['my_pos'],p) for p in self.safe_areas])
+        num_carring = game_state.get_agent_state(self.index).num_carrying
+        if len(obs['both_agent_food']) <= 2:
+            if self.current_state != "HOME":
+                print(self.index, self.current_state,"HOME")
+            self.current_state = "HOME"
+        elif num_carring > 0 and dist_home + 1 >= game_state.data.timeleft / 4.:
+            if self.current_state != "HOME":
+                print(self.index, self.current_state,"HOME TIMEOUT")
+            self.current_state = "HOME"
+        elif obs['closest_defender_dist'] <= 4:
+            self.current_state = 'CONSCIOUS_ATTACK_FOOD'
+            if self.current_state != "CONSCIOUS_ATTACK_FOOD":
+                print(self.index, self.current_state,"CONSCIOUS_ATTACK_FOOD")
         else:
-            return successor
-
-  def choose_action(self, game_state):
-    # print(self.index, self.current_mode)
-    legal_actions = game_state.get_legal_actions(self.index)
-    if len(legal_actions) == 0:
-      return None
-    action_vals = {}
-    best_value = float('-inf')
-    for action in legal_actions:
-      value = self.evaluate(game_state, action)
-      action_vals[action] = value
-      if value > best_value:
-        best_value = value
-    best_actions = [k for k, v in action_vals.items() if v == best_value]
-    # return random.choice(legal_actions)
-    return random.choice(best_actions)
-  
-  def get_features(self, game_state, action):
-    features = util.Counter()
-    successor = self.get_successor(game_state, action)
-    food_to_eat = self.get_food(game_state).as_list()
-    my_pos = successor.get_agent_state(self.index).get_position()
-    teammate_index = (self.index + 2) % 4
-
-    walls = game_state.get_walls()
-    enemies = [game_state.get_agent_state(i) for i in self.get_opponents(game_state)]
-    ghosts= [a for a in enemies if not a.is_pacman and a.get_position() != None]
-    enemy_pacman = [a.get_position() for a in enemies if a.is_pacman and a.get_position() != None]
-    delete = [a.get_position() for a in enemies if a.is_pacman]
-    # print(len(delete)- len(enemy_pacman))
-    agent_position = game_state.get_agent_position(self.index)
-    x, y = agent_position
-    
-    next_x, next_y = int(my_pos[0]), int(my_pos[1])
-
-    # DEFENCIVE
-   
-    # ATACK
-    # FOOD
-    if len(food_to_eat) > 0:  # This should always be True,  but better safe than sorry
-        min_distance = min([self.get_maze_distance(my_pos, food) for food in food_to_eat])
-        diagonal = (walls.width**2 + walls.height**2)**0.5
-        # diagonal is the furthest that the food can be and in a way we normalize the [0,1] 
-        features["closest-food"] = float(min_distance) / diagonal
-    
-    capsules = self.get_capsules(successor)    
-    if len(capsules) > 0:
-      closest_cap = min([self.get_maze_distance((next_x, next_y), cap) for cap in capsules])
-      # MAXIMIZE THIS
-      features["closest_capsule"] = (self.max_distance - closest_cap) / self.max_distance
-      
-    # closest_enemy_ghost
-    if len(ghosts) > 0:
-      min_ghost = min(ghosts, key=lambda g: self.get_maze_distance((next_x, next_y), g.get_position()))
-      closest_enemy = self.get_maze_distance((next_x, next_y), min_ghost.get_position())
-      
-      if len(capsules) > 0:
-        min_ghost_to_capsule = min([self.get_maze_distance(min_ghost.get_position(), cap) for cap in capsules])
+            if self.current_state != "ATTACK_FOOD":
+                print(self.index, self.current_state,"ATTACK_FOOD")
+            self.current_state = 'ATTACK_FOOD'
+            
+            
+    def observe(self, game_state):
+        obs = {}
+        my_pos = game_state.get_agent_position(self.index)
+        obs['my_pos'] = my_pos
         
-      # scared enemies
-      if min_ghost.scared_timer > 0 and min_ghost.scared_timer < 21: # less then 5 more moves of them beeing scared
-        # MINIMIZE THIS (you want to eat the ghosts)
-        features["closest_enemy_ghost"] = -1 * (6 - closest_enemy) / 6
-      elif  min_ghost.scared_timer >= 21:
-        features["closest_enemy_ghost"] = 0
-      elif closest_enemy <= 5 and len(capsules) > 0 and min_ghost_to_capsule > closest_cap:
-          features["closest_capsule"] *=10000
-          features["closest-food"] = 0
-          features["closest_enemy_ghost"] = 0
-      elif closest_enemy <= 5:
-        # MINIMIZE THIS
-        features["closest_enemy_ghost"] = (6 - closest_enemy) / 6
-        features["closest-food"] = 0
-      elif closest_enemy == 0:
-        features["dead"] = 1
+        # Enemies
+        opponents = self.get_opponents(game_state)
+        obs['enemies'] = [game_state.get_agent_state(i) for i in opponents]
         
+        # Defenders (Enemy Ghosts in their territory)
+        obs['defenders'] = [e for e in obs['enemies'] if not e.is_pacman and e.get_position() and e.scared_timer < 5]
         
-        
-
-    # BOTH ATTACK AND DEFEND WILL CHASE AFTER THE OPPONENT PACMAN
-    # JUST WITH DIFFERENT WEIGHTS (FOR ATTACKER IS LESS IMPORTANT TO CATCH THE ENEMY)
-    # closest_enemy_pacman
-    if len(enemy_pacman) > 0:
-      closest_enemy = min([self.get_maze_distance((next_x, next_y), e) for e in enemy_pacman])
-      if closest_enemy <= 5 and game_state.get_agent_state(self.index).scared_timer == 0:
-        # poveke
-        features["closest_enemy_pacman"] = (6 - closest_enemy) / 6
-    
-    # vertical distance to enemy VERTICAL    
-    if len(enemy_pacman) > 0 :
-      closest_enemy = min([abs(next_y - e[1]) for e in enemy_pacman])
-      if closest_enemy <= 5 and game_state.get_agent_state(self.index).scared_timer == 0:
-        # poveke
-        features["closest_enemy_pacman_vertical"] = (6 - closest_enemy) / 6
-
-
-
-    # MINIMIZE THIS
-    features["food_left"] = len(food_to_eat) / self.total_food
-
-    # MAXIMIZE THIS
-    score = self.get_score(successor)
-    features["score"] = (self.get_score(successor) + self.total_food) / (self.total_food * 2)
-    
-    # BOTH DEFEND IF WINNING
-    if self.get_score(game_state) > 0:
-      self.weights = self.weights_array[0]  # defende weights
-      self.current_mode = "DOUBLE_DEFENCE"
-    else:
-      # this will set the weights to attack and defend instead of both defend
-      self.initial_weight()
-
-    
-    closest_way_home = 0
-    if game_state.get_agent_state(self.index).is_pacman:
-      # pomalo
-      features["num_carring"] = game_state.get_agent_state(self.index).num_carrying / self.total_food
-      middle = walls.width // 2 - 1 if  self.red else walls.width // 2
-      closest_way_home = min([self.get_maze_distance((next_x, next_y), (middle, y)) for y in range(walls.height) if not game_state.has_wall(middle, y)])
-      features["num_carring"] = features["num_carring"]  * closest_way_home / self.max_distance
-      if features["num_carring"] + score > 0:
-        # if with the food you are winning then "go home"
-        features["num_carring"] *=100
-  
-      if self.dead_ends_depth[next_y][next_x] > 0:
-        features["dead_end"] = self.dead_ends_depth[next_y][next_x] / self.max_dead_end
-      if len(enemy_pacman) > 0 and closest_enemy < 5:
-        features["dead_end"] *= 100
-      # print("DEAD END:", features["dead_end"],self.dead_ends_depth[next_y][next_x])
-
-    if action == Directions.STOP: features['stop'] = 1
-    rev = Directions.REVERSE[game_state.get_agent_state(self.index).configuration.direction]
-    if action == rev: features['reverse'] = 1
-
-
-    if game_state.get_agent_state(self.index).is_pacman:
-      features["defence"] = 0
-    else:
-      features["defence"] = 1
-    
-    old_game_state = self.get_previous_observation()
-    if old_game_state is  not None:
-      food_old = self.get_food_you_are_defending(old_game_state).as_list()
-      food_new = self.get_food_you_are_defending(game_state).as_list()
-
-      missing_food = list(set(food_old) - set(food_new))
-      # print(missing_food)
-
-      if len(missing_food) > 0:
-        self.defence_ancor_point = missing_food[0]
-
-
-    # print(walls.width, walls.height)
-    if self.current_mode == "DEFENCE":
-      anchor1 = self.default_defence_ancor_point1
-      anchor2 = self.default_defence_ancor_point2
-        
-    if self.current_mode == "DOUBLE_DEFENCE":
-      # if smaller then get anchor 0 and 1 else get 2 and 3
-      anchor1 = self.double_anchors[0] if self.index < teammate_index else self.double_anchors[2]
-      anchor2 = self.double_anchors[1] if self.index < teammate_index else self.double_anchors[3]      
-      
-    if self.current_mode == "DEFENCE" or self.current_mode == "DOUBLE_DEFENCE":
-      # DEFENSIVE AGENT
-      pacman_unknown_position= [a for a in enemies if a.is_pacman]
-      if len(pacman_unknown_position) == 0 and self.defence_ancor_point != anchor1 and self.defence_ancor_point != anchor2:
-        dist_ap1 = self.get_maze_distance((x, y), anchor1)
-        dist_ap2 = self.get_maze_distance((x, y), anchor2)
-        if dist_ap1 < dist_ap2:
-          self.defence_ancor_point = anchor1
+        # Food
+        foods = self.get_food(game_state).as_list()
+        obs['both_agent_food'] = foods
+        # avg_height = sum([ y for (x, y) in foods])/len(foods)
+        # print(avg_height,self.height//2)
+        # Split food logic
+        if self.index < self.teammate_index:
+            obs['food'] = [ (x, y) for (x, y) in foods if y >= self.height // 2]
+            if not obs['food']: obs['food'] = foods
         else:
-          self.defence_ancor_point = anchor2      
-          
-      if (x,y) == anchor1:
-        self.defence_ancor_point = anchor2
-      elif (x,y) == anchor2:
-        self.defence_ancor_point = anchor1
-      # IF WE ARE SCARED DO NOT RUN AWAY FROM ENEMY PACMAN
-      if game_state.get_agent_state(self.index).scared_timer > 0:
-        features["closest_enemy_pacman"] = 0
-        features["closest_enemy_pacman_vertical"] = 0
-        # features["defence"] = 0
-        features["defence_ancor_point"] = 0
-        # features["reverse"] = 0
-      else:
-        features["closest_enemy_pacman"] *= 40
-        features["closest_enemy_pacman_vertical"] *= 40
-        features["closest_capsule"] = 0
-        features["closest-food"] = 0
-        # features["closest_enemy_ghost"] = 0
-        features["num_carring"] = 0
-        features["dead_end"] = 0
-        features["stop"] *= 3
-  
-      
-    elif self.current_mode == "ATTACK":
-      # OFFENSIVE AGENT
-      if len(enemy_pacman) == 0 or  min([self.get_maze_distance((next_x, next_y), e) for e in enemy_pacman]) == 0:
-        self.mode = "ATTACK"
+            obs['food'] = [ (x, y) for (x, y) in foods if y < self.height // 2]
+            if not obs['food']: obs['food'] = foods
+        # print(obs['food'])
+        # Distances
+        obs['dist_home'] = min([self.get_maze_distance(my_pos, pos) for pos in self.safe_areas])
 
-
-      team_mate_position = game_state.get_agent_state(teammate_index).get_position()
-      between_team_mate_distance = self.get_maze_distance((next_x, next_y), team_mate_position)
-
-      if  len(enemy_pacman) > 0 and between_team_mate_distance > 5:
-        closest_enemy = min([self.get_maze_distance((next_x, next_y), e) for e in enemy_pacman])
-        closest_enemy_pacman_to_team_mate = min([self.get_maze_distance(team_mate_position, e) for e in enemy_pacman])
-        if closest_enemy  <= 5 and closest_enemy_pacman_to_team_mate < 5:
-          self.mode = "DEFFENSIVE"
-      if closest_way_home + 3 >= game_state.data.timeleft / 4:
-        self.mode = "TIMEOUT"
-    
-      # mode where you try to suround the enemy from both sides
-      if self.mode == "DEFFENSIVE":
-        features["closest-food"] = 0
-        features["closest_enemy_ghost"] = 0
-        features["num_carring"] = 0
-        features["dead_end"] = 0
-        features["closest_enemy_pacman"] *= 40
-        features["closest_enemy_pacman_vertical"] *= 40
+        if len(obs['defenders']) > 0:
+            obs['closest_defender_dist'] = min([self.get_maze_distance(my_pos, d.get_position()) for d in obs['defenders']])
+        else:
+            obs['closest_defender_dist'] = 999
+            
+        # Dangerous Cells (Ghost Exclusion Zones)
+        # We treat the ghost's position AND the cells immediately around it as walls
+        danger = set()
+        for d in obs['defenders']:
+            p = d.get_position()
+            if p:
+                px, py = int(p[0]), int(p[1])
+                danger.add((px, py))
+                # Add radius 1 buffer (Standard Pacman kill zone)
+                for dx, dy in [(0,1), (0,-1), (1,0), (-1,0)]:
+                    danger.add((px+dx, py+dy))
+                    
+        # Add dead ends to danger if a ghost is chasing us? 
+        # Optional: You could add deep dead-ends to danger here, but A* handles it naturally.
+        obs['dangerous_cells'] = danger
         
-      elif self.mode == "ATTACK":
-        features["defence"] = 0
-        features["defence_ancor_point"] = 0
-        features["reverse"] = 0
+        return obs
 
-      # when it is timeout the following features are not important
-      elif self.mode == "TIMEOUT":
-        features["closest-food"] = 0
-        features["num_carring"] = 0
-        features["dead_end"] = 0
-        features["closest_enemy_pacman"] = 0
-        features["closest_enemy_pacman_vertical"]  = 0
-        features["defence"] = 0
-        features["defence_ancor_point"] = 0
-        features["reverse"] = 0
-        features["home_anchor_point"] = closest_way_home / self.max_distance
-         
-    features["defence_ancor_point"] = self.get_maze_distance((next_x, next_y), (self.defence_ancor_point))
-    return features
-
-  def get_maze_distance(self, pos1, pos2):
-    """
-    Returns the distance between pos1 and pos2 using A* search.
-    Cost is 1.0 for own territory and 1.2 for enemy territory.
-    """
-    # Ensure coordinates are integers
-    pos1 = (int(pos1[0]), int(pos1[1]))
-    pos2 = (int(pos2[0]), int(pos2[1]))
-
-    if pos1 == pos2:
-        return 0
-
-    # Priority Queue for A*: stores ((x, y), cost) ordered by f = cost + heuristic
-    pq = util.PriorityQueue()
-    pq.push((pos1, 0), 0)
-    
-    # Keep track of lowest cost to reach a node
-    visited = {} # format: { (x,y): cost }
-    
-    mid_width = self.layout_width // 2
-
-    while not pq.is_empty():
-        current_pos, current_g = pq.pop()
-
-        if current_pos == pos2:
-            return current_g
-
-        # Optimization: if we found a shorter way to this node already, skip
-        if current_pos in visited and visited[current_pos] <= current_g:
-            continue
-        visited[current_pos] = current_g
-
-        # Expand neighbors
-        neighbors = Actions.get_legal_neighbors(current_pos, self.walls)
-        for next_pos in neighbors:
-            nx, ny = next_pos
+    def find_escape_action(self, game_state, start_pos, unsafe_positions):
+        """
+        Uses A* to find the shortest path to home that strictly avoids unsafe positions.
+        """
+        # Priority Queue Item: (priority, current_position, path_of_actions)
+        queue = util.PriorityQueue()
+        queue.push((start_pos, []), 0)
+        
+        visited = set()
+        visited.add(start_pos)
+        
+        # Optimization: Simple heuristic is Manhattan distance to the midline
+        # Because 'home' is a long vertical line, not a single point.
+        
+        while not queue.is_empty():
+            curr_pos, path = queue.pop()
             
-            # Calculate cost to move TO next_pos
-            step_cost = self.own_cost
+            # If we reached any safe area, return the first step of the path
+            if curr_pos in self.safe_areas:
+                if len(path) > 0:
+                    return path[0]
+                return None # Already home
+
+            # Performance Cutoff (prevent timeout on huge mazes)
+            if len(path) > 30: 
+                continue 
+
+            x, y = int(curr_pos[0]), int(curr_pos[1])
             
-            # Check territory based on team color
-            is_enemy_territory = False
-            if self.red:
-                # Red team: Left is home, Right (>= mid) is enemy
-                if nx >= mid_width: is_enemy_territory = True
+            # Get legal neighbors (pass walls to save time)
+            neighbors = Actions.get_legal_neighbors((x, y), game_state.get_walls())
+            
+            for nx, ny in neighbors:
+                next_pos = (nx, ny)
+                
+                # Skip visited or dangerous cells
+                if next_pos in visited: continue
+                if next_pos in unsafe_positions: continue
+                
+                visited.add(next_pos)
+                
+                # Determine Direction
+                dx, dy = nx - x, ny - y
+                if dx == 1: action = 'East'
+                elif dx == -1: action = 'West'
+                elif dy == 1: action = 'North'
+                elif dy == -1: action = 'South'
+                else: action = 'Stop'
+                
+                new_path = path + [action]
+                
+                # Heuristic: Manhattan Distance to the safe x-boundary (self.mid_x)
+                # This encourages moving toward the safe side.
+                h_score = abs(nx - self.mid_x)
+                g_score = len(new_path)
+                f_score = g_score + h_score
+                
+                queue.push((next_pos, new_path), f_score)
+                
+        return None # No path found (Trapped)
+
+    def choose_action(self, game_state):
+        obs = self.observe(game_state)
+        self.update_state(game_state, obs)
+        
+        my_pos = obs['my_pos']
+        actions = game_state.get_legal_actions(self.index)
+        non_deadend_action = self.get_non_deadend_actions(game_state)
+
+        # --- MODE: HOME (ESCAPE) ---
+        if self.current_state == "HOME":
+            # 1. Try to find a clean path home using A*
+            best_action = self.find_escape_action(game_state, my_pos, obs['dangerous_cells'])
+            
+            if best_action:
+                return best_action
+                
+            # 2. FALLBACK: SURVIVAL MODE
+            # If A* returns None, we are trapped or blocked. 
+            # We must just maximize distance to the closest ghost to stall.
+            best_survival_action = None
+            max_dist = -1
+            
+            # Filter moves that kill us immediately
+            safe_moves = []
+            for action in actions:
+                successor = game_state.generate_successor(self.index, action)
+                next_pos = successor.get_agent_state(self.index).get_position()
+                if next_pos not in obs['dangerous_cells']:
+                    safe_moves.append((action, next_pos))
+            
+            # If no safe moves, just pick random legal and pray
+            if not safe_moves:
+                return random.choice(actions)
+                
+            # Pick the move that puts us furthest from the closest defender
+            for action, next_pos in safe_moves:
+                # Calculate dist to closest defender
+                if obs['defenders']:
+                    dist = min([self.get_maze_distance(next_pos, d.get_position()) for d in obs['defenders']])
+                else:
+                    dist = 0
+                
+                if dist > max_dist:
+                    max_dist = dist
+                    best_survival_action = action
+            
+            return best_survival_action if best_survival_action else random.choice(actions)
+
+        # --- MODE 1: AGGRESSIVE SWEEP ---
+        if self.current_state == 'ATTACK_FOOD':
+            # ... (Keep your existing logic here) ...
+            pass 
+            # (Adding it back briefly so the function is complete for context)
+            min_dist_to_food = 999999
+            best_a = random.choice(actions)
+            for food in obs['food']:
+                dist = self.get_maze_distance(my_pos, food)
+                if dist < min_dist_to_food:
+                    min_dist_to_food = dist
+            for action in actions:
+                successor = game_state.generate_successor(self.index, action)
+                new_pos = successor.get_agent_state(self.index).get_position()
+                new_min = min([self.get_maze_distance(new_pos,f) for f in obs['food']]) if obs['food'] else 0
+                if min_dist_to_food > new_min:
+                    return action
+            return best_a
+
+        # --- MODE 2: CONSCIOUS ATTACK ---
+        elif self.current_state == 'CONSCIOUS_ATTACK_FOOD':
+            # This logic was mostly fine, just ensuring it returns something
+            x,y = int(my_pos[0]), int(my_pos[1])
+
+            # If inside a dead end, only move OUT (deeper < shallower)
+            if self.depth_binary_mask[y][x] == 1:
+                best_depth_action = None
+                curr_depth = self.dead_ends_depth[y][x]
+                for action in actions:
+                    successor = game_state.generate_successor(self.index, action)
+                    nx,ny = successor.get_agent_state(self.index).get_position()
+                    nx,ny = int(nx), int(ny)
+                    # We want to go to a cell with LOWER depth value (closer to exit)
+                    if self.dead_ends_depth[ny][nx] < curr_depth: 
+                        return action
+                return random.choice(actions) # Should not happen in valid dead end
+
             else:
-                # Blue team: Right is home, Left (< mid) is enemy
-                if nx < mid_width: is_enemy_territory = True
-            
-            if is_enemy_territory:
-                step_cost = self.enemy_cost
+                # Not in a dead end: Avoid entering one if ghost is near
+                legal_food = [f for f in obs['food'] if self.depth_binary_mask[f[1]][f[0]] == 0]
+                if not legal_food: legal_food = obs['food']
 
-            new_g = current_g + step_cost
+                min_enemy = min([self.get_maze_distance(my_pos,g.get_position()) for g in obs['defenders']])
+                min_food = min([self.get_maze_distance(my_pos,f) for f in legal_food]) if legal_food else 0
+                
+                best_action = None
+                # Score actions: +EnemyDist, -FoodDist
+                best_score = -99999
 
-            # Check if this path is better than any previously found path to next_pos
-            if next_pos not in visited or new_g < visited[next_pos]:
-                # Manhattan distance heuristic
-                h = abs(nx - pos2[0]) + abs(ny - pos2[1])
-                f = new_g + h
-                pq.push((next_pos, new_g), f)
+                for action in non_deadend_action:
+                    successor = game_state.generate_successor(self.index, action)
+                    new_pos = successor.get_agent_state(self.index).get_position()
+                    
+                    # Avoid dangerous cells strictly here too
+                    if new_pos in obs['dangerous_cells']: continue
 
-    # Return a large number if no path found (shouldn't happen in standard mazes unless enclosed)
-    return 999999
-  
-  
-  
-  def get_weights(self):
-    # [ defence weights, attack weights]
-    return [
-      {
-        "closest-food": -1500,
-        "closest_enemy_ghost": -300,
-        "closest_enemy_pacman": 2000,
-        "closest_enemy_pacman_vertical": 500,
-        # "food_left": 0,
-        # "score": 0,
-        "closest_capsule": 0,
-        "num_carring": -100,
-        "dead_end": -100,
-        "defence": 500,
-        "defence_ancor_point": -100,
-        "stop": -150,
-        "reverse": -50,
-        "dead": 10000,
-        "home_anchor_point": 0
-      },
-      {
-        "closest-food": -2500,
-        "closest_enemy_ghost": -300,
-        "closest_enemy_pacman": 100,
-        "closest_enemy_pacman_vertical": 50,
-        # "food_left": 0,         
-        # "score": 0,
-        "closest_capsule": -40,
-        "num_carring": -3500,
-        "dead_end": -350,
-        "defence": 500,
-        "defence_ancor_point": 0,
-        "stop": -50,
-        "reverse": -5,
-        "dead": 100000,
-        "home_anchor_point": -2000 
-      }
-    ]
-  def initial_weight(self):
-    teammate_index = (self.index + 2) % 4
-    # 0 defend 1 atack
-    # let the smaller number be the attack
-    weights_index = 1 if self.index < teammate_index else 0
-    # print("Agent index:", self.index, "Weights index:", weights_index)
-    self.weights = self.weights_array[weights_index]
-    self.current_mode = "ATTACK" if self.index < teammate_index else "DEFENCE"
+                    d_food = min([self.get_maze_distance(new_pos,f) for f in legal_food]) if legal_food else 0
+                    d_enemy = min([self.get_maze_distance(new_pos,f.get_position()) for f in obs['defenders']])
+                    
+                    # Heuristic score
+                    score = d_enemy * 2 - d_food 
+                    if score > best_score:
+                        best_score = score
+                        best_action = action
+                
+                if best_action: return best_action
+                return random.choice(non_deadend_action) if non_deadend_action else random.choice(actions)
 
-# LIGHTBLUE
-# DEFENCIVE
-class Agent1(DDagent):
-  def delete():
-    pass
-
-class Agent2(DDagent):
-  def delete():
-    pass
-  
-  
-#Agent index: 1 Weights index: 1 ATTACK
-#Agent index: 3 Weights index: 0 DEFENCE
-
-
-
-# Defensive Checkpoints for agent 1: (18, 3) and (18, 11)
-# Default Defence Ancor Points: (17, 14) (17, 3)
+        return random.choice(actions)
