@@ -30,9 +30,26 @@ class ComplexStateAgent(CaptureAgent):
         self.current_state = 'ATTACK_FOOD'
         self.target_position = None
         
+        # Loop tracking
+        self.recent_positions = []
+        self.loop_window = 20
+
             # Initialize state maps
         self.compute_dead_ends(game_state)
         self.depth_binary_mask = [[1 if self.dead_ends_depth[y][x] > 0 else 0 for x in range(self.width)]for y in range(self.height)]
+
+
+    def detect_loop(self, pos):
+        """
+        Returns True if the agent has visited <=5 unique tiles
+        in the last 20 (loop window) steps.
+        """
+        self.recent_positions.append(pos)
+        if len(self.recent_positions) > self.loop_window:
+            self.recent_positions.pop(0)
+        uniques = set(self.recent_positions)
+        return len(uniques) <= 5 and len(self.recent_positions) == self.loop_window
+
 
     def get_boundary_points(self, game_state):
         points = []
@@ -135,11 +152,18 @@ class ComplexStateAgent(CaptureAgent):
         # If a ghost is within 5 units, switch to CONSCIOUS mode
         dist_home = min([self.get_maze_distance(obs['my_pos'],p) for p in self.safe_areas])
         num_carring = game_state.get_agent_state(self.index).num_carrying
+
+        if self.detect_loop(obs['my_pos']):
+            if self.current_state != "LOOPING":
+                print(self.index, self.current_state, "→ LOOPING")
+            self.current_state = "LOOPING"
+            return                        
+
         if len(obs['both_agent_food']) <= 2:
             if self.current_state != "HOME":
                 print(self.index, self.current_state,"HOME")
             self.current_state = "HOME"
-        elif num_carring > 0 and dist_home + 3 >= game_state.data.timeleft / 4.:
+        elif num_carring > 0 and dist_home + 4 >= game_state.data.timeleft / 4.:
             if self.current_state != "HOME":
                 print(self.index, self.current_state,"HOME TIMEOUT")
             self.current_state = "HOME"
@@ -265,6 +289,76 @@ class ComplexStateAgent(CaptureAgent):
                 
         return None # No path found (Trapped)
 
+
+    def find_alternate_path(self, game_state, start_pos, danger_cells):
+        """
+        A* search to find a safe alternative path around enemies / loop.
+        - Avoid danger_cells (ghost zones)
+        - Prefer leaving the loop if safe, but prioritize staying alive
+        - Loop-aware: penalize staying in recent positions
+        """
+        walls = game_state.get_walls()
+        loop_zone = set(self.recent_positions)
+        defenders = [d for d in self.observe(game_state)['defenders']]
+
+        # Find all safe areas (not strictly home, but any open non-danger tile)
+        safe_tiles = [(x, y) for x in range(self.width) for y in range(self.height)
+                    if not walls[x][y] and (x, y) not in danger_cells]
+
+        if not safe_tiles:
+            return None
+
+        pq = util.PriorityQueue()
+        pq.push((start_pos, []), 0)
+        visited = set([start_pos])
+
+        while not pq.is_empty():
+            pos, path = pq.pop()
+            x, y = pos
+
+            # If we reached a safe tile outside the loop, stop
+            if pos not in loop_zone:
+                return path[0] if path else None
+
+            for nx, ny in Actions.get_legal_neighbors((x, y), walls):
+                next_pos = (nx, ny)
+                if next_pos in visited:
+                    continue
+                if next_pos in danger_cells:
+                    continue
+
+                visited.add(next_pos)
+
+                # Determine action
+                dx, dy = nx - x, ny - y
+                if dx == 1: act = 'East'
+                elif dx == -1: act = 'West'
+                elif dy == 1: act = 'North'
+                elif dy == -1: act = 'South'
+                else: act = 'Stop'
+
+                new_path = path + [act]
+
+                # Heuristic: distance to nearest safe tile
+                h_safe = min(self.get_maze_distance(next_pos, st) for st in safe_tiles)
+
+                # Penalty if still in the loop
+                h_loop = 5 if next_pos in loop_zone else 0
+
+                # Safety bonus: farther from nearest defender
+                if defenders:
+                    d_enemy = min(self.get_maze_distance(next_pos, d.get_position()) for d in defenders)
+                else:
+                    d_enemy = 10  # no enemies → safe
+
+                # Heuristic formula: prefer safety, prefer leaving loop if safe
+                fscore = len(new_path) + h_safe + h_loop - d_enemy
+
+                pq.push((next_pos, new_path), fscore)
+
+        return None  # no safe alternative path found
+
+
     def choose_action(self, game_state):
         obs = self.observe(game_state)
         self.update_state(game_state, obs)
@@ -380,5 +474,29 @@ class ComplexStateAgent(CaptureAgent):
                 
                 if best_action: return best_action
                 return random.choice(non_deadend_action) if non_deadend_action else random.choice(actions)
+
+        # --- MODE: LOOPING ---
+        if self.current_state == "LOOPING":
+            # Try alternate A* path
+            best = self.find_alternate_path(game_state, my_pos, obs['dangerous_cells'])
+
+            if best:
+                return best
+
+            # fallback: try any action that leaves the loop-zone. maybe moving 1 away from it and then make will trick the enemy to go away
+            loop_zone = set(self.recent_positions)
+            escape_moves = []
+            for action in actions:
+                successor = game_state.generate_successor(self.index, action)
+                npos = successor.get_agent_state(self.index).get_position()
+                if npos not in loop_zone:
+                    escape_moves.append(action)
+
+            if escape_moves:
+                return random.choice(escape_moves)
+
+            # worst fallback
+            return random.choice(actions)
+
 
         return random.choice(actions)
